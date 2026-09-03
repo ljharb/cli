@@ -75,6 +75,77 @@ t.test('basic publish - no npmVersion', async t => {
   t.ok(ret, 'publish succeeded')
 })
 
+t.test('publish strips patchedDependencies from the registry manifest', async t => {
+  const { publish } = t.mock('..')
+  const registry = new MockRegistry({
+    tap: t,
+    registry: opts.registry,
+    authorization: token,
+  })
+  const manifest = {
+    name: 'libnpmpublish-test',
+    version: '1.0.0',
+    description: 'test libnpmpublish package',
+    patchedDependencies: { 'lodash@4.17.21': 'patches/lodash@4.17.21.patch' },
+  }
+  const spec = npa(manifest.name)
+  // patchedDependencies must not appear in the published version metadata
+  const { patchedDependencies, ...clean } = manifest
+
+  const packument = {
+    _id: manifest.name,
+    name: manifest.name,
+    description: manifest.description,
+    'dist-tags': {
+      latest: '1.0.0',
+    },
+    versions: {
+      '1.0.0': {
+        _id: `${manifest.name}@${manifest.version}`,
+        _nodeVersion: process.versions.node,
+        ...clean,
+        dist: {
+          shasum,
+          integrity: integrity.sha512[0].toString(),
+          tarball: 'http://mock.reg/libnpmpublish-test/-/libnpmpublish-test-1.0.0.tgz',
+        },
+      },
+    },
+    access: null,
+    _attachments: {
+      'libnpmpublish-test-1.0.0.tgz': {
+        content_type: 'application/octet-stream',
+        data: tarData.toString('base64'),
+        length: tarData.length,
+      },
+    },
+  }
+
+  registry.nock.put(`/${spec.escapedName}`, packument).reply(201, {})
+  const ret = await publish(manifest, tarData, {
+    ...opts,
+    npmVersion: null,
+  })
+  t.ok(ret, 'publish succeeded with patchedDependencies stripped')
+})
+
+t.test('fails when publishing a package with packageExtensions', async t => {
+  const { publish } = t.mock('..')
+  // no registry interceptor: the publish must fail before any request is made
+  const manifest = {
+    name: 'libnpmpublish-test',
+    version: '1.0.0',
+    description: 'test libnpmpublish package',
+    packageExtensions: { 'foo@1': { dependencies: { bar: '^1.0.0' } } },
+  }
+
+  await t.rejects(
+    publish(manifest, tarData, { ...opts, npmVersion: null }),
+    { code: 'EPACKAGEEXTENSIONS', message: /must not be published/ },
+    'refuses to publish a package containing packageExtensions'
+  )
+})
+
 t.test('scoped publish', async t => {
   const { publish } = t.mock('..')
   const registry = new MockRegistry({
@@ -789,6 +860,48 @@ t.test('user-supplied provenance - success', async t => {
     provenanceFile: './test/fixtures/valid-bundle.json',
   })
   t.ok(ret, 'publish succeeded')
+})
+
+t.test('provenance and provenanceFile together throws', async t => {
+  mockGlobals(t, {
+    'process.env': {
+      CI: true,
+      GITHUB_ACTIONS: true,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://mock.oidc',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'decafbad',
+    },
+  })
+
+  const { publish } = t.mock('..', {
+    'ci-info': { GITHUB_ACTIONS: true, name: 'GitHub Actions' },
+    '../lib/provenance': {
+      generateProvenance: () => {
+        throw new Error('generateProvenance should not be called')
+      },
+      verifyProvenance: () => {
+        throw new Error('verifyProvenance should not be called')
+      },
+    },
+  })
+
+  const manifest = {
+    name: '@npmcli/libnpmpublish-test',
+    version: '1.0.0',
+    description: 'test libnpmpublish package',
+  }
+
+  await t.rejects(
+    publish(manifest, tarData, {
+      ...opts,
+      access: 'public',
+      provenance: true,
+      provenanceFile: './test/fixtures/valid-bundle.json',
+    }),
+    {
+      code: 'EUSAGE',
+      message: /cannot be used together/,
+    }
+  )
 })
 
 t.test('user-supplied provenance - failure', async t => {

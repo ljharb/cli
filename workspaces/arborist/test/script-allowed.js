@@ -1,6 +1,6 @@
 const t = require('tap')
 const isScriptAllowed = require('../lib/script-allowed.js')
-const { trustedDisplay } = isScriptAllowed
+const { matchFileOrDir, trustedDisplay } = isScriptAllowed
 
 // Test nodes default to a consistent registry-tarball shape: the resolved
 // URL's name+version match the supplied name+version. Tests that need to
@@ -196,6 +196,90 @@ t.test('local tarball key — npa parses *.tgz paths as type=file', t => {
   t.end()
 })
 
+t.test('local tarball key — relative key resolves from the project root', t => {
+  const path = require('node:path')
+  const rootPath = path.resolve('project')
+  const tgzPath = path.resolve(rootPath, 'local-pkg.tgz')
+  const tgzNode = node({
+    name: 'local-pkg',
+    packageName: 'local-pkg',
+    version: '1.0.0',
+    resolved: `file:${tgzPath}`,
+    root: { path: rootPath },
+  })
+
+  t.equal(isScriptAllowed(tgzNode, { 'file:local-pkg.tgz': true }), true)
+  t.equal(isScriptAllowed(tgzNode, { 'file:other-pkg.tgz': true }), null)
+  t.end()
+})
+
+t.test('local tarball key — matches consistentResolve Windows representation', t => {
+  const resolved = String.raw`file:C:\absolute\path\local-pkg.tgz`
+  const parsed = {
+    saveSpec: 'file:C:/absolute/path/local-pkg.tgz',
+    fetchSpec: String.raw`C:\absolute\path\local-pkg.tgz`,
+  }
+
+  t.equal(matchFileOrDir({ resolved }, parsed), true)
+  t.equal(matchFileOrDir({ resolved }, {
+    saveSpec: 'file:C:/absolute/path/other-pkg.tgz',
+    fetchSpec: String.raw`C:\absolute\path\other-pkg.tgz`,
+  }), false)
+  t.end()
+})
+
+t.test('local tarball key — Windows absolute key forms match', {
+  skip: process.platform !== 'win32',
+}, t => {
+  const resolved = String.raw`file:C:\project\local-pkg.tgz`
+  const tgzNode = node({
+    name: 'local-pkg',
+    packageName: 'local-pkg',
+    version: '1.0.0',
+    resolved,
+    root: { path: String.raw`C:\project` },
+  })
+
+  t.equal(isScriptAllowed(tgzNode, {
+    [String.raw`file:C:\project\local-pkg.tgz`]: true,
+  }), true)
+  t.equal(isScriptAllowed(tgzNode, {
+    'file:C:/project/local-pkg.tgz': true,
+  }), true)
+  t.equal(isScriptAllowed(tgzNode, {
+    'file:C:/project/other-pkg.tgz': true,
+  }), null)
+  t.end()
+})
+
+t.test('local tarball key — Windows UNC key matches', {
+  skip: process.platform !== 'win32',
+}, t => {
+  const consistentResolve = require('../lib/consistent-resolve.js')
+  const key = 'file:////server/share/local-pkg.tgz'
+  const tgzNode = node({
+    name: 'local-pkg',
+    packageName: 'local-pkg',
+    version: '1.0.0',
+    resolved: consistentResolve(key),
+    root: { path: String.raw`C:\project` },
+  })
+
+  t.equal(isScriptAllowed(tgzNode, { [key]: true }), true)
+  t.end()
+})
+
+t.test('file source matching keeps POSIX backslashes distinct', t => {
+  const resolved = String.raw`file:/tmp/local\pkg.tgz`
+  const parsed = {
+    saveSpec: 'file:/tmp/local/pkg.tgz',
+    fetchSpec: '/tmp/local/pkg.tgz',
+  }
+
+  t.equal(matchFileOrDir({ resolved }, parsed), false)
+  t.end()
+})
+
 t.test('remote tarball — exact resolved match', t => {
   const remoteNode = node({
     name: 'pkg',
@@ -205,6 +289,17 @@ t.test('remote tarball — exact resolved match', t => {
   })
   t.equal(isScriptAllowed(remoteNode, { 'https://example.com/pkg.tgz': true }), true)
   t.equal(isScriptAllowed(remoteNode, { 'https://example.com/other.tgz': true }), null)
+  t.end()
+})
+
+t.test('remote tarball key does not match a file source', t => {
+  const fileNode = node({
+    name: 'pkg',
+    packageName: 'pkg',
+    version: '1.0.0',
+    resolved: 'file:https://example.com/pkg.tgz',
+  })
+  t.equal(isScriptAllowed(fileNode, { 'https://example.com/pkg.tgz': true }), null)
   t.end()
 })
 
@@ -226,6 +321,57 @@ t.test('omitLockfileRegistryResolved: name-only match via edges; version-pinned 
   t.equal(isScriptAllowed(omitted, { 'canvas@2.11.0': true }), null,
     'version-pinned match requires the trusted URL-derived version')
   t.equal(isScriptAllowed(omitted, { 'canvas@3': true }), null)
+  t.end()
+})
+
+t.test('omitLockfileRegistryResolved: version-pinned deny fails closed', t => {
+  // No resolved URL means no trusted version. A version-pinned deny must
+  // still block (fail closed); a matching allow stays refused.
+  const omitted = () => ({
+    name: 'evilpkg',
+    packageName: 'evilpkg',
+    version: '1.0.0',
+    resolved: undefined,
+    location: 'node_modules/evilpkg',
+    edgesIn: new Set([{ name: 'evilpkg', spec: '^1.0.0' }]),
+  })
+
+  // Exact-version deny: blocked.
+  t.equal(isScriptAllowed(omitted(), { 'evilpkg@1.0.0': false }), false,
+    'version-pinned deny blocks even without a trusted version')
+  // Exact-disjunction deny: blocked.
+  t.equal(isScriptAllowed(omitted(), { 'evilpkg@1.0.0 || 2.0.0': false }), false,
+    'exact-disjunction deny blocks even without a trusted version')
+  // The exploit: name-only allow + version-pinned deny. Deny still wins.
+  t.equal(isScriptAllowed(omitted(), { evilpkg: true, 'evilpkg@1.0.0': false }), false,
+    'deny wins over a name-only allow when the version is unverifiable')
+
+  // Allow stays strict: an unverifiable version is never authorized.
+  t.equal(isScriptAllowed(omitted(), { 'evilpkg@1.0.0 || 2.0.0': true }), null,
+    'exact-disjunction allow is refused without a trusted version')
+
+  // Name mismatch: fail-closed must not over-match a different package.
+  t.equal(isScriptAllowed(omitted(), { 'otherpkg@1.0.0': false }), null,
+    'a version-pinned deny for a different name does not match')
+
+  t.end()
+})
+
+t.test('omitLockfileRegistryResolved + alias: version-pinned deny fails closed', t => {
+  // `"trusted": "npm:naughty@1.0.0"`, resolved omitted. A deny on the
+  // underlying name must block; the alias name authorizes nothing.
+  const aliasOmitted = {
+    name: 'trusted',
+    packageName: 'naughty',
+    version: '1.0.0',
+    resolved: undefined,
+    location: 'node_modules/trusted',
+    edgesIn: new Set([{ name: 'trusted', spec: 'npm:naughty@1.0.0' }]),
+  }
+  t.equal(isScriptAllowed(aliasOmitted, { 'naughty@1.0.0': false }), false,
+    'underlying-name version deny blocks the aliased package')
+  t.equal(isScriptAllowed(aliasOmitted, { 'trusted@1.0.0': false }), null,
+    'alias-name version deny does not match the underlying package')
   t.end()
 })
 

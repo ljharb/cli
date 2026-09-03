@@ -271,6 +271,7 @@ const definitions = {
     default: '',
     type: [String, Array],
     hint: '<package-list>',
+    envExport: false,
     description: `
       Comma-separated list of packages whose install-time lifecycle scripts
       (\`preinstall\`, \`install\`, \`postinstall\`, and \`prepare\` for
@@ -353,6 +354,10 @@ const definitions = {
       Across sources, the standard precedence applies (cli > env > project >
       user > global), so a higher-priority source can always relax or
       override a lower-priority one.
+
+      As with \`min-release-age\`, when this cutoff blocks a fix that
+      \`npm audit fix\` would install, npm keeps the vulnerable version, warns,
+      and exits with a non-zero code.
 
       Packages whose names match \`min-release-age-exclude\` are exempt from
       this filter.
@@ -770,6 +775,18 @@ const definitions = {
     `,
     flatten,
   }),
+  'extension-file': new Definition('extension-file', {
+    default: null,
+    type: [null, path],
+    description: `
+      Path to a project-local npm extension file to load instead of
+      discovering \`.npm-extension.mjs\` / \`.npm-extension.cjs\` at the
+      project root. Must resolve inside the project root and use a \`.mjs\`
+      or \`.cjs\` extension. Only honored from project config or the command
+      line, never from user, global, or builtin config.
+    `,
+    flatten,
+  }),
   'fetch-retries': new Definition('fetch-retries', {
     default: 2,
     type: Number,
@@ -1026,6 +1043,17 @@ const definitions = {
     `,
     flatten,
   }),
+  'ignore-extension': new Definition('ignore-extension', {
+    default: false,
+    type: Boolean,
+    description: `
+      If true, npm does not import or execute a root \`.npm-extension.mjs\` /
+      \`.npm-extension.cjs\` file (or one selected via \`extension-file\`).
+      \`ignore-scripts\` implies \`ignore-extension\`, since both disable
+      root-owned install-time code.
+    `,
+    flatten,
+  }),
   'ignore-scripts': new Definition('ignore-scripts', {
     default: false,
     type: Boolean,
@@ -1036,8 +1064,17 @@ const definitions = {
       as \`npm start\`, \`npm stop\`, \`npm restart\`, \`npm test\`, and \`npm
       run\` will still run their intended script if \`ignore-scripts\` is
       set, but they will *not* run any pre- or post-scripts.
+
+      Setting \`ignore-scripts\` also disables \`.npm-extension\` execution,
+      as if \`ignore-extension\` were set.
     `,
-    flatten,
+    // ignore-scripts implies ignore-extension: both disable root install-time code
+    flatten (key, obj, flatOptions) {
+      flatOptions.ignoreScripts = obj['ignore-scripts']
+      if (obj['ignore-scripts']) {
+        flatOptions.ignoreExtension = true
+      }
+    },
   }),
   include: new Definition('include', {
     default: [],
@@ -1117,11 +1154,12 @@ const definitions = {
     `,
   }),
   'init-license': new Definition('init-license', {
-    default: 'ISC',
+    default: '',
     hint: '<license>',
     type: String,
     description: `
       The value \`npm init\` should use by default for the package license.
+      If not set, the license field will be omitted from new packages.
     `,
   }),
   'init-module': new Definition('init-module', {
@@ -1192,7 +1230,7 @@ const definitions = {
     `,
   }),
   'init.license': new Definition('init.license', {
-    default: 'ISC',
+    default: '',
     type: String,
     deprecated: `
       Use \`--init-license\` instead.
@@ -1240,8 +1278,15 @@ const definitions = {
         necessary within directory structure.
       nested: (formerly --legacy-bundling) install in place, no hoisting.
       shallow (formerly --global-style) only install direct deps at top-level.
-      linked: (experimental) install in node_modules/.store, link in place,
-        unhoisted.
+      linked: install in node_modules/.store, link in place, unhoisted.
+
+      We recommend that package authors use \`--install-strategy=linked\`
+      during development to catch undeclared ("phantom") dependencies before
+      publishing: the isolated layout only exposes a package's declared
+      dependencies, so an \`import\` of a package that was never added to
+      \`package.json\` can fail instead of resolving by accident and shipping
+      broken. See [Catching undeclared ("phantom")
+      dependencies](/using-npm/developers#catching-undeclared-phantom-dependencies).
     `,
     flatten,
   }),
@@ -1510,6 +1555,12 @@ const definitions = {
        spawns a sub-process with \`--before\` while preparing a \`git:\` or
        \`github:\` dependency); when both apply, \`before\` wins within a
        single source and across sources the standard precedence rules apply.
+
+       When this window stops \`npm audit fix\` from installing a patched
+       version (because the fix was published too recently), npm keeps the
+       package at its vulnerable version, warns that the fix was blocked, and
+       exits with a non-zero code. To install the fix, add the package to
+       \`min-release-age-exclude\`, or relax \`min-release-age\` or \`before\`.
 
        Packages whose names match \`min-release-age-exclude\` are exempt from
        this filter.
@@ -1782,6 +1833,63 @@ const definitions = {
     `,
     flatten,
   }),
+  'patches-dir': new Definition('patches-dir', {
+    default: 'patches',
+    type: String,
+    description: `
+      The directory, relative to the project root, where \`npm patch commit\`
+      writes patch files for \`patchedDependencies\`.
+    `,
+    flatten,
+  }),
+  // CLI-only: deliberately no flatten, so a value in .npmrc/env never reaches the install pipeline.
+  // npm install reads it from the cli layer only, and npm ci rejects it.
+  'allow-unused-patches': new Definition('allow-unused-patches', {
+    default: false,
+    type: Boolean,
+    description: `
+      Install even when a registered patch in \`patchedDependencies\` matches no
+      installed package. Does not silence patch apply failures.
+
+      This flag is only honored when passed on the command line; it is ignored
+      in \`.npmrc\` and environment variables, and rejected by \`npm ci\`.
+    `,
+  }),
+  'ignore-patch-failures': new Definition('ignore-patch-failures', {
+    default: false,
+    type: Boolean,
+    description: `
+      Install even when a registered patch fails to apply, with a warning per
+      failure. Intended for incident response only.
+
+      This flag is only honored when passed on the command line; it is ignored
+      in \`.npmrc\` and environment variables, and rejected by \`npm ci\`.
+    `,
+  }),
+  'edit-dir': new Definition('edit-dir', {
+    default: null,
+    type: [null, path],
+    description: `
+      Override the temporary directory used by \`npm patch add\` to prepare a
+      package for editing.
+    `,
+  }),
+  'ignore-existing': new Definition('ignore-existing', {
+    default: false,
+    type: Boolean,
+    description: `
+      With \`npm patch add\`, discard a previous unfinished edit directory and
+      start fresh.
+    `,
+  }),
+  'keep-edit-dir': new Definition('keep-edit-dir', {
+    default: false,
+    type: Boolean,
+    description: `
+      With \`npm patch commit\`, do not remove the edit directory after
+      committing the patch.
+    `,
+  }),
   parseable: new Definition('parseable', {
     default: false,
     type: Boolean,
@@ -1899,6 +2007,10 @@ const definitions = {
     description: `
       When publishing from a supported cloud CI/CD system, the package will be
       publicly linked to where it was built and published from.
+
+      When the \`provenance-file\` config is set, it takes precedence and
+      automatic provenance generation (including via trusted publishing/OIDC)
+      is skipped.
     `,
     flatten,
   }),
@@ -1909,6 +2021,9 @@ const definitions = {
     exclusive: ['provenance'],
     description: `
       When publishing, the provenance bundle at the given path will be used.
+
+      This takes precedence over automatic provenance generation in trusted
+      publishing flows.
     `,
     flatten,
   }),
@@ -1949,7 +2064,7 @@ const definitions = {
   }),
   'replace-registry-host': new Definition('replace-registry-host', {
     default: 'npmjs',
-    hint: '<npmjs|never|always> | hostname',
+    hint: '<npmjs|never|always> | hostname | url',
     type: ['npmjs', 'never', 'always', String],
     description: `
       Defines behavior for replacing the registry host in a lockfile with the
@@ -1960,7 +2075,14 @@ const definitions = {
       "never", then use the registry value. If set to "always", then replace the
       registry host with the configured host every time.
 
-      You may also specify a bare hostname (e.g., "registry.npmjs.org").
+      You may also specify a bare hostname (e.g., "registry.npmjs.org") to only
+      replace URLs coming from that host.
+
+      You may also specify a full URL including a path (e.g.,
+      "https://old-registry.example.com/npm/path"). In that case, resolved URLs
+      whose host and path begin with that prefix will have the entire prefix
+      replaced with the configured registry URL (host and path), without
+      duplicating path segments.
     `,
     flatten,
   }),
@@ -2384,6 +2506,22 @@ const definitions = {
       (packages with install scripts that are neither approved nor denied).
       \`--ignore-scripts\` and \`--dangerously-allow-all-scripts\` both
       override this setting.
+
+      Optional dependencies that cannot be installed on the current platform
+      or engine (a non-matching \`os\`, \`cpu\`, or \`libc\`) are not flagged,
+      because their install scripts never run.
+    `,
+    flatten,
+  }),
+  'strict-npmrc': new Definition('strict-npmrc', {
+    default: false,
+    type: Boolean,
+    description: `
+      If set to \`true\`, unknown configuration keys found in \`.npmrc\` files
+      are treated as a hard error instead of a warning.
+
+      Unknown command line flags and abbreviated flags always error regardless
+      of this setting.
     `,
     flatten,
   }),
@@ -2446,6 +2584,16 @@ const definitions = {
 
       Timing information will also be reported in the terminal. To suppress this
       while still writing the timing file, use \`--silent\`.
+    `,
+  }),
+  to: new Definition('to', {
+    default: null,
+    hint: '<version>',
+    type: [null, String],
+    description: `
+      Used by \`npm patch update\` to set the version to rebase a patch onto
+      when it cannot be read from \`package-lock.json\` — for example an
+      exact-version selector, or a version that has not been installed yet.
     `,
   }),
   umask: new Definition('umask', {
