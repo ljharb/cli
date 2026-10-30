@@ -1,3 +1,4 @@
+const { resolve, sep } = require('node:path')
 const npa = require('npm-package-arg')
 const semver = require('semver')
 const versionFromTgz = require('./version-from-tgz.js')
@@ -43,7 +44,9 @@ const isScriptAllowed = (node, policy) => {
   let anyDeny = false
 
   for (const [key, value] of Object.entries(policy)) {
-    if (!matches(node, key)) {
+    // Pass deny intent so matchRegistry can fail closed on an unverifiable
+    // version: a deny still blocks, an allow stays refused.
+    if (!matches(node, key, value === false)) {
       continue
     }
     if (value === false) {
@@ -66,10 +69,10 @@ const isScriptAllowed = (node, policy) => {
   return null
 }
 
-const matches = (node, key) => {
+const matches = (node, key, failClosed) => {
   let parsed
   try {
-    parsed = npa(key)
+    parsed = npa(key, node?.root?.path)
   } catch {
     return false
   }
@@ -78,7 +81,7 @@ const matches = (node, key) => {
     case 'tag':
     case 'range':
     case 'version':
-      return matchRegistry(node, parsed)
+      return matchRegistry(node, parsed, failClosed)
     case 'git':
       return matchGit(node, parsed)
     case 'file':
@@ -97,6 +100,23 @@ const matches = (node, key) => {
   }
 }
 
+// True when the node lives in the linked install strategy's `node_modules/.store` directory; such registry-managed packages must never derive identity from the store's internal `file:` link specs.
+const isStoreBacked = (node) => {
+  if (node?.isInStore) {
+    return true
+  }
+  // Nodes loaded from the hidden lockfile do not retain isInStore, so fall back to the path, anchored to this tree's own store so an unrelated project's `.store` never qualifies.
+  const paths = [node?.path, node?.realpath].filter(p => typeof p === 'string')
+  const roots = [node?.root?.path, node?.root?.realpath].filter(p => typeof p === 'string')
+  for (const root of roots) {
+    const store = resolve(root, 'node_modules', '.store')
+    if (paths.some(path => path.startsWith(`${store}${sep}`))) {
+      return true
+    }
+  }
+  return false
+}
+
 const resolvedSourceSpecs = (node) => {
   const specs = []
   const seen = new Set()
@@ -110,7 +130,8 @@ const resolvedSourceSpecs = (node) => {
 
   add(node?.resolved)
 
-  if (!node?.resolved && node?.linksIn && typeof node.linksIn[Symbol.iterator] === 'function') {
+  if (!node?.resolved && !isStoreBacked(node) &&
+      node?.linksIn && typeof node.linksIn[Symbol.iterator] === 'function') {
     let hasIncomingLink = false
     for (const link of node.linksIn) {
       hasIncomingLink = true
@@ -132,7 +153,7 @@ const resolvedSourceSpecs = (node) => {
   return specs
 }
 
-const matchRegistry = (node, parsed) => {
+const matchRegistry = (node, parsed, failClosed) => {
   // If this node is not a registry dep, refuse the match. A registry-style
   // key (`pkg`, `pkg@1`, `pkg@1 || 2`) must not match a tarball or git node
   // even if their names happen to coincide.
@@ -168,8 +189,13 @@ const matchRegistry = (node, parsed) => {
     if (parsed.fetchSpec === '*' || parsed.rawSpec === '' || parsed.rawSpec === '*') {
       return true
     }
-    if (!trusted.version || !isExactVersionDisjunction(parsed.fetchSpec)) {
+    if (!isExactVersionDisjunction(parsed.fetchSpec)) {
       return false
+    }
+    // Unverifiable version (omit-lockfile-registry-resolved): a deny blocks,
+    // an allow is refused.
+    if (!trusted.version) {
+      return failClosed
     }
     return semver.satisfies(trusted.version, parsed.fetchSpec, { loose: true })
   }
@@ -178,6 +204,10 @@ const matchRegistry = (node, parsed) => {
   /* istanbul ignore else: parsed.type at this point is always 'version';
      the istanbul-ignored fallback below handles the impossible case. */
   if (parsed.type === 'version') {
+    // Unverifiable version: a deny blocks, an allow is refused.
+    if (!trusted.version) {
+      return failClosed
+    }
     return trusted.version === parsed.fetchSpec
   }
 
@@ -224,10 +254,32 @@ const getTrustedRegistryIdentity = (node) => {
 }
 
 const nameFromEdges = (node) => {
-  if (!node.edgesIn || typeof node.edgesIn[Symbol.iterator] !== 'function') {
+  const name = nameFromEdgeSet(node?.edgesIn)
+  if (name || !isStoreBacked(node) || node?.edgesIn?.size !== 0) {
+    return name
+  }
+  // A store-backed link target carries no edges of its own; they land on the incoming Links, so consult their edges instead, refusing when a Link is non-registry, unidentified, or disagrees with another Link.
+  let linkName = null
+  if (node?.linksIn && typeof node.linksIn[Symbol.iterator] === 'function') {
+    for (const link of node.linksIn) {
+      if (!link.isRegistryDependency) {
+        return null
+      }
+      const name = nameFromEdgeSet(link.edgesIn)
+      if (!name || (linkName && linkName !== name)) {
+        return null
+      }
+      linkName = name
+    }
+  }
+  return linkName
+}
+
+const nameFromEdgeSet = (edgesIn) => {
+  if (!edgesIn || typeof edgesIn[Symbol.iterator] !== 'function') {
     return null
   }
-  for (const edge of node.edgesIn) {
+  for (const edge of edgesIn) {
     let parsed
     try {
       parsed = npa.resolve(edge.name, edge.spec)
@@ -317,8 +369,15 @@ const matchGit = (node, parsed) => {
 }
 
 const matchFileOrDir = (node, parsed) => {
+  // consistentResolve stores local sources as `file:` plus npa's absolute,
+  // platform-native fetchSpec.
+  const absoluteFileSpec = parsed.fetchSpec && `file:${parsed.fetchSpec}`
   return resolvedSourceSpecs(node)
-    .some(resolved => resolved === parsed.saveSpec || resolved === parsed.fetchSpec)
+    .some(resolved =>
+      resolved === parsed.saveSpec ||
+      resolved === parsed.fetchSpec ||
+      resolved === absoluteFileSpec
+    )
 }
 
 const matchRemote = (node, parsed) => {
@@ -332,7 +391,14 @@ const isRegistryNode = (node) => {
   // edge resolves to a registry spec, which is much harder to spoof than
   // the URL.
   if (typeof node.isRegistryDependency === 'boolean') {
-    return node.isRegistryDependency
+    if (node.isRegistryDependency) {
+      return true
+    }
+    // A store-backed link target carries no edges of its own; they land on the incoming Links (npm/cli#9939), so delegate the edge-based check to them, but never for ordinary local symlink targets that share the same topology.
+    if (isStoreBacked(node) && node.edgesIn?.size === 0 && node.linksIn?.size > 0) {
+      return [...node.linksIn].every(link => link.isRegistryDependency)
+    }
+    return false
   }
   // Fall back to URL parsing for nodes without the arborist getter
   // (e.g. test fixtures, lockfiles with omit-lockfile-registry-resolved).
@@ -366,7 +432,9 @@ const trustedDisplay = (node) => {
 
 module.exports = isScriptAllowed
 module.exports.isScriptAllowed = isScriptAllowed
+module.exports.matches = matches
 module.exports.isExactVersionDisjunction = isExactVersionDisjunction
 module.exports.getTrustedRegistryIdentity = getTrustedRegistryIdentity
 module.exports.resolvedSourceSpecs = resolvedSourceSpecs
+module.exports.matchFileOrDir = matchFileOrDir
 module.exports.trustedDisplay = trustedDisplay

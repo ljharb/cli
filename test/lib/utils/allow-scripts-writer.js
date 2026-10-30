@@ -1,8 +1,10 @@
 const t = require('tap')
 const path = require('node:path')
+const isScriptAllowed = require('../../../workspaces/arborist/lib/script-allowed.js')
 const {
   applyApprovalForPackage,
   applyDenyForPackage,
+  keyTargetsNode,
   nameKeyFor,
   versionedKeyFor,
   isSingleVersionPin,
@@ -21,6 +23,23 @@ const node = (overrides = {}) => {
       ?? `https://registry.npmjs.org/${urlPkg}/-/${urlPkg}-${version}.tgz`,
     location: overrides.location ?? `node_modules/${name}`,
     isRegistryDependency: overrides.isRegistryDependency ?? true,
+  }
+}
+
+// A registry node with no `resolved` URL in the lockfile. Its trusted name
+// comes from a dependency edge, but its version isn't trustable, so
+// versionedKeyFor returns null (npm/cli#9558).
+const noResolvedNode = (overrides = {}) => {
+  const name = overrides.name ?? 'pkg'
+  const version = overrides.version ?? '1.0.0'
+  return {
+    name,
+    packageName: overrides.packageName ?? name,
+    version,
+    resolved: undefined,
+    location: `node_modules/${name}`,
+    isRegistryDependency: true,
+    edgesIn: new Set([{ name, spec: overrides.spec ?? `^${version}` }]),
   }
 }
 
@@ -214,6 +233,73 @@ t.test('applyApprovalForPackage — keeps existing pin matching one installed, a
   t.strictSame(allowScripts, { 'lodash@3.10.1': true, 'lodash@4.17.21': true })
 })
 
+t.test('versionedKeyFor — registry dep without a resolved URL has no trustable version', async t => {
+  const n = noResolvedNode({ name: 'esbuild', version: '0.25.0' })
+  t.equal(nameKeyFor(n), 'esbuild', 'name still recoverable from the dependency edge')
+  t.equal(versionedKeyFor(n), null, 'version cannot be trusted without a resolved URL')
+})
+
+t.test('applyApprovalForPackage — pin mode falls back to name-only when version is not trustable', async t => {
+  const { allowScripts, changes, warning } = applyApprovalForPackage(
+    {},
+    [noResolvedNode({ name: 'esbuild', version: '0.25.0' })],
+    { pin: true }
+  )
+  t.strictSame(allowScripts, { esbuild: true }, 'approved by name instead of silently skipped')
+  t.strictSame(changes, [{ key: 'esbuild', change: 'added' }])
+  t.match(warning, /no "resolved" URL/, 'explains why a pin was not written')
+})
+
+t.test('applyApprovalForPackage — mixed resolved/no-resolved collapses to one name-only entry', async t => {
+  const { allowScripts, warning } = applyApprovalForPackage(
+    {},
+    [
+      node({ name: 'esbuild', version: '0.21.5' }),
+      noResolvedNode({ name: 'esbuild', version: '0.25.0' }),
+    ],
+    { pin: true }
+  )
+  t.strictSame(allowScripts, { esbuild: true }, 'no redundant pin alongside the name-only entry')
+  t.match(warning, /no "resolved" URL/)
+})
+
+t.test('applyApprovalForPackage — existing pin collapses into name-only when a sibling cannot be pinned', async t => {
+  const { allowScripts, changes } = applyApprovalForPackage(
+    { 'esbuild@0.21.5': true },
+    [
+      node({ name: 'esbuild', version: '0.21.5' }),
+      noResolvedNode({ name: 'esbuild', version: '0.25.0' }),
+    ],
+    { pin: true }
+  )
+  t.strictSame(allowScripts, { esbuild: true })
+  t.match(changes, [
+    { key: 'esbuild@0.21.5', change: 'removed-pinned-allow' },
+    { key: 'esbuild', change: 'added' },
+  ])
+})
+
+t.test('applyApprovalForPackage — no-resolved dep already approved by name is a no-op', async t => {
+  const { allowScripts, changes } = applyApprovalForPackage(
+    { esbuild: true },
+    [noResolvedNode({ name: 'esbuild', version: '0.25.0' })],
+    { pin: true }
+  )
+  t.strictSame(allowScripts, { esbuild: true })
+  t.strictSame(changes, [])
+})
+
+t.test('applyApprovalForPackage — no-resolved dep with name-only deny still loses to the deny', async t => {
+  const { allowScripts, changes, warning } = applyApprovalForPackage(
+    { esbuild: false },
+    [noResolvedNode({ name: 'esbuild', version: '0.25.0' })],
+    { pin: true }
+  )
+  t.strictSame(allowScripts, { esbuild: false }, 'deny wins; nothing approved')
+  t.strictSame(changes, [])
+  t.match(warning, /esbuild is denied/)
+})
+
 t.test('applyDenyForPackage — empty allowScripts adds name-only false', async t => {
   const { allowScripts, changes } = applyDenyForPackage(
     {},
@@ -293,6 +379,21 @@ t.test('applyApprovalForPackage — file dep uses resolved as both keys', async 
     { pin: true }
   )
   t.strictSame(allowScripts, { 'file:../local': true })
+})
+
+t.test('versionedKeyFor — local file key round-trips through policy matching', async t => {
+  const rootPath = path.resolve('project')
+  const local = {
+    name: 'local',
+    packageName: 'local',
+    version: '1.0.0',
+    resolved: `file:${path.resolve(rootPath, 'local.tgz')}`,
+    root: { path: rootPath },
+    isRegistryDependency: false,
+  }
+  const key = versionedKeyFor(local)
+
+  t.equal(isScriptAllowed(local, { [key]: true }), true)
 })
 
 t.test('applyApprovalForPackage — empty nodes returns unchanged', async t => {
@@ -409,6 +510,29 @@ t.test('applyApprovalForPackage — file dep with deny entry blocks approval', a
   t.match(warning, /denied|versioned deny/)
 })
 
+t.test('applyApprovalForPackage — relative file deny matches absolute resolved', async t => {
+  const rootPath = path.resolve('project')
+  const resolved = `file:${path.resolve(rootPath, 'local.tgz')}`
+  const local = {
+    name: 'local',
+    packageName: 'local',
+    version: '1.0.0',
+    resolved,
+    root: { path: rootPath },
+    isRegistryDependency: false,
+  }
+  const existing = { 'file:local.tgz': false }
+  const { allowScripts, changes, warning } = applyApprovalForPackage(
+    existing,
+    [local],
+    { pin: true }
+  )
+
+  t.strictSame(allowScripts, existing)
+  t.strictSame(changes, [])
+  t.match(warning, /denied|versioned deny/)
+})
+
 t.test('applyApprovalForPackage — remote tarball deny blocks approval', async t => {
   const remote = { name: 'pkg', packageName: 'pkg', version: '1.0.0', resolved: 'https://example.com/pkg.tgz' }
   const { warning } = applyApprovalForPackage(
@@ -417,6 +541,7 @@ t.test('applyApprovalForPackage — remote tarball deny blocks approval', async 
     { pin: true }
   )
   t.match(warning, /denied|versioned deny/)
+  t.equal(keyTargetsNode('https://example.com/other.tgz', remote), false)
 })
 
 t.test('applyApprovalForPackage — no-pin with no name produces no-op', async t => {
@@ -620,7 +745,7 @@ t.test('denyWarning branches on key shape per RFC §approve-scripts', async t =>
     { pin: true }
   )
   t.match(pinned.warning, /versioned deny/)
-  t.match(pinned.warning, /npm deny-scripts canvas/)
+  t.match(pinned.warning, /npm install-scripts deny canvas/)
   t.match(pinned.warning, /widen the deny to all versions/)
   t.match(pinned.warning, /remove the entry/)
 
@@ -631,7 +756,7 @@ t.test('denyWarning branches on key shape per RFC §approve-scripts', async t =>
     { pin: true }
   )
   t.match(multi.warning, /versioned deny/)
-  t.match(multi.warning, /npm deny-scripts canvas/)
+  t.match(multi.warning, /npm install-scripts deny canvas/)
 })
 
 t.test('denyWarning: tag-type key (pkg@latest: false) is name-only', async t => {
